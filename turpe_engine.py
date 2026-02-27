@@ -2,17 +2,19 @@
 Moteur de calcul TURPE 7 — Enedis
 En vigueur au 1er août 2025 (Délibération CRE n°2025-78 du 13 mars 2025)
 
-Périmètre :
-- HTA       : 5 plages (Pointe, HPH, HCH, HPB, HCB), 4 FTA
-- BT > 36   : 4 plages (HPH, HCH, HPB, HCB), 2 FTA
-- BT ≤ 36   : puissance unique, 5 FTA (pas de CMDPS)
+Formats supportés :
+- Enedis SGE R63  : colonnes Horodate / Valeur(W) / séparateur ;
+- Likewatt        : colonnes Date de la mesure / Heure de la mesure / PA(W) / séparateur ;
 
-Annualisation automatique :
-- Tous les coûts sont exprimés en €/AN quelle que soit la durée du fichier.
-- CG, CC                : fixes annuels → pas de correction.
-- CS part puissance (bi × P) : abonnement annuel → pas de correction.
-- CS part énergie (ci × Ei)  : proportionnelle à l'énergie → × (365 / nb_jours).
-- CMDPS                      : calculée sur les mois présents → × (365 / nb_jours).
+Contrainte TURPE sur les puissances souscrites (BT > 36 kVA et HTA) :
+  P_HPH <= P_HCH <= P_HPB <= P_HCB   (et Pointe <= HPH pour HTA)
+  → plage la plus chère = PS la plus basse
+  → plage la moins chère = PS la plus haute
+
+Heures creuses configurables :
+  Par défaut 8h-20h en HP (= 12h HP + 12h HC).
+  L'utilisateur peut définir ses propres plages HP via hp_debut / hp_fin.
+  HC = tout ce qui n'est pas HP (jours ouvrés), week-end toujours HC.
 """
 
 import numpy as np
@@ -81,38 +83,14 @@ COMPOSANTES_FIXES = {
 
 
 # ─────────────────────────────────────────────
-# 2. INGESTION DES DONNÉES ENEDIS SGE (R63)
+# 2. INGESTION — FONCTIONS COMMUNES
 # ─────────────────────────────────────────────
 
-def charger_fichier_enedis(filepath_or_buffer) -> pd.DataFrame:
+def _finaliser_dataframe(df_clean: pd.DataFrame, resolution_source: str) -> pd.DataFrame:
     """
-    Charge un fichier CSV Enedis SGE format R63 (courbe de charge).
-    Adapte automatiquement les calculs à la période réelle du fichier.
-
-    Retourne un DataFrame horaire avec :
-    - timestamp           : datetime
-    - puissance_kw        : puissance max sur l'heure (kW)
-    - puissance_kw_10min  : puissance max sur 10 min (kW) — CMDPS HTA
-
-    Attrs : prm, periode_debut, periode_fin, nb_jours, facteur_annualisation
+    Prend un DataFrame propre (timestamp, puissance_kw) et produit
+    le DataFrame horaire final avec puissance_kw_10min et attrs d'annualisation.
     """
-    df = pd.read_csv(filepath_or_buffer, sep=";", parse_dates=["Horodate"])
-
-    colonnes_requises = {"Horodate", "Valeur", "Unité"}
-    if not colonnes_requises.issubset(df.columns):
-        raise ValueError(f"Colonnes manquantes. Attendues : {colonnes_requises}. Trouvées : {set(df.columns)}")
-
-    if not (df["Unité"] == "W").all():
-        raise ValueError(f"Unité inattendue : {df['Unité'].unique()}. Seul 'W' est supporté.")
-
-    # Nettoyage et conversion W → kW
-    df_clean = pd.DataFrame({
-        "timestamp":    df["Horodate"],
-        "puissance_kw": df["Valeur"] / 1000.0,
-        "prm":          df["Identifiant PRM"].iloc[0] if "Identifiant PRM" in df.columns else None,
-    }).sort_values("timestamp").drop_duplicates("timestamp").reset_index(drop=True)
-
-    # Rééchantillonnage 10 min (max) → CMDPS HTA
     df_10min = (
         df_clean.set_index("timestamp")["puissance_kw"]
         .resample("10min").max()
@@ -120,14 +98,12 @@ def charger_fichier_enedis(filepath_or_buffer) -> pd.DataFrame:
         .rename(columns={"puissance_kw": "puissance_kw_10min"})
     )
 
-    # Rééchantillonnage 1h (max) → CS et CMDPS BT
     df_1h = (
         df_clean.set_index("timestamp")["puissance_kw"]
         .resample("h").max()
         .reset_index()
     )
 
-    # Ajout puissance max 10 min par heure
     df_1h = df_1h.merge(
         df_10min
         .assign(timestamp=df_10min["timestamp"].dt.floor("h"))
@@ -136,21 +112,117 @@ def charger_fichier_enedis(filepath_or_buffer) -> pd.DataFrame:
         on="timestamp", how="left"
     )
 
-    # Calcul du facteur d'annualisation
     debut    = df_clean["timestamp"].min()
     fin      = df_clean["timestamp"].max()
     nb_jours = max(1, (fin - debut).days)
     fact_ann = round(365.0 / nb_jours, 4)
 
-    # Stockage des métadonnées dans les attrs du DataFrame
-    df_1h.attrs["prm"]                    = df_clean["prm"].iloc[0]
-    df_1h.attrs["periode_debut"]          = debut
-    df_1h.attrs["periode_fin"]            = fin
-    df_1h.attrs["nb_jours"]               = nb_jours
-    df_1h.attrs["facteur_annualisation"]  = fact_ann
-    df_1h.attrs["resolution_source"]      = df["Pas"].iloc[0] if "Pas" in df.columns else "inconnue"
+    df_1h.attrs["prm"]                   = df_clean.get("prm", pd.Series([None])).iloc[0] if "prm" in df_clean.columns else None
+    df_1h.attrs["periode_debut"]         = debut
+    df_1h.attrs["periode_fin"]           = fin
+    df_1h.attrs["nb_jours"]              = nb_jours
+    df_1h.attrs["facteur_annualisation"] = fact_ann
+    df_1h.attrs["resolution_source"]     = resolution_source
 
     return df_1h
+
+
+# ─────────────────────────────────────────────
+# 2a. FORMAT ENEDIS SGE R63
+# ─────────────────────────────────────────────
+
+def charger_fichier_enedis(filepath_or_buffer) -> pd.DataFrame:
+    """
+    Charge un fichier CSV Enedis SGE format R63.
+    Colonnes : Horodate (datetime) | Valeur (W) | Unité | Identifiant PRM
+    Séparateur : ;  |  Pas : PT5M (5 min)
+    """
+    df = pd.read_csv(filepath_or_buffer, sep=";", parse_dates=["Horodate"], low_memory=False)
+
+    colonnes_requises = {"Horodate", "Valeur", "Unité"}
+    if not colonnes_requises.issubset(df.columns):
+        raise ValueError(f"Colonnes manquantes pour format R63. Trouvées : {set(df.columns)}")
+
+    if not (df["Unité"] == "W").all():
+        raise ValueError(f"Unité inattendue : {df['Unité'].unique()}. Seul 'W' supporté.")
+
+    df_clean = pd.DataFrame({
+        "timestamp":    df["Horodate"],
+        "puissance_kw": df["Valeur"] / 1000.0,
+        "prm":          df["Identifiant PRM"].iloc[0] if "Identifiant PRM" in df.columns else None,
+    }).sort_values("timestamp").drop_duplicates("timestamp").reset_index(drop=True)
+
+    resolution = df["Pas"].iloc[0] if "Pas" in df.columns else "PT5M"
+    return _finaliser_dataframe(df_clean, resolution)
+
+
+# ─────────────────────────────────────────────
+# 2b. FORMAT LIKEWATT
+# ─────────────────────────────────────────────
+
+def charger_fichier_likewatt(filepath_or_buffer) -> pd.DataFrame:
+    """
+    Charge un fichier CSV format Likewatt (export courbe de charge).
+    Colonnes : Date de la mesure (DD-MM-YYYY) | Heure de la mesure (HH:MM) | PA (W)
+    Séparateur : ;  |  Pas : 5 min
+    """
+    df = pd.read_csv(filepath_or_buffer, sep=";", low_memory=False)
+
+    colonnes_requises = {"Date de la mesure", "Heure de la mesure", "PA"}
+    if not colonnes_requises.issubset(df.columns):
+        raise ValueError(f"Colonnes manquantes pour format Likewatt. Trouvées : {set(df.columns)}")
+
+    # Fusion date + heure → timestamp (format DD-MM-YYYY HH:MM)
+    df["timestamp"] = pd.to_datetime(
+        df["Date de la mesure"].astype(str) + " " + df["Heure de la mesure"].astype(str),
+        format="%d-%m-%Y %H:%M",
+        errors="coerce"
+    )
+
+    df_clean = pd.DataFrame({
+        "timestamp":    df["timestamp"],
+        "puissance_kw": pd.to_numeric(df["PA"], errors="coerce") / 1000.0,
+        "prm":          df["PRM"].iloc[0] if "PRM" in df.columns else None,
+    }).dropna(subset=["timestamp", "puissance_kw"])\
+      .sort_values("timestamp").drop_duplicates("timestamp").reset_index(drop=True)
+
+    pas = df["Pas en minutes"].dropna().iloc[0] if "Pas en minutes" in df.columns else 5
+    return _finaliser_dataframe(df_clean, f"PT{int(pas)}M")
+
+
+# ─────────────────────────────────────────────
+# 2c. DÉTECTION AUTOMATIQUE DU FORMAT
+# ─────────────────────────────────────────────
+
+def charger_fichier_auto(filepath_or_buffer) -> Tuple[pd.DataFrame, str]:
+    """
+    Détecte automatiquement le format (R63 ou Likewatt) et charge le fichier.
+    Retourne (dataframe, format_detecte).
+    """
+    import io
+
+    # Lecture de l'en-tête pour détection
+    if hasattr(filepath_or_buffer, "read"):
+        contenu = filepath_or_buffer.read()
+        if isinstance(contenu, bytes):
+            contenu = contenu.decode("utf-8", errors="replace")
+        premiere_ligne = contenu.split("\n")[0]
+        buffer = io.StringIO(contenu)
+    else:
+        with open(filepath_or_buffer, "r", encoding="utf-8", errors="replace") as f:
+            premiere_ligne = f.readline()
+        buffer = filepath_or_buffer
+
+    if "Horodate" in premiere_ligne:
+        return charger_fichier_enedis(buffer), "Enedis R63"
+    elif "Date de la mesure" in premiere_ligne:
+        return charger_fichier_likewatt(buffer), "Likewatt"
+    else:
+        raise ValueError(
+            "Format de fichier non reconnu. "
+            "Formats supportés : Enedis SGE R63 (colonne 'Horodate') "
+            "ou Likewatt (colonnes 'Date de la mesure' / 'Heure de la mesure' / 'PA')."
+        )
 
 
 def resumer_chargement(df: pd.DataFrame) -> dict:
@@ -177,17 +249,38 @@ def resumer_chargement(df: pd.DataFrame) -> dict:
 # 3. CLASSIFICATION DES HEURES
 # ─────────────────────────────────────────────
 
-def classifier_plage(timestamp: pd.Timestamp, domaine: str, fta: str) -> str:
+def classifier_plage(
+    timestamp: pd.Timestamp,
+    domaine: str,
+    fta: str,
+    hc_debut: int = 22,
+    hc_fin: int = 6,
+) -> str:
     """
     Retourne la plage temporelle d'un timestamp.
+
+    Paramètres :
+    - hc_debut / hc_fin : bornes des Heures Creuses (défaut 22h → 6h).
+      Si hc_debut > hc_fin : les HC chevauchent minuit (ex: 22h→6h).
+      Si hc_debut < hc_fin : les HC sont en journée (ex: 0h→8h).
+      HC s'appliquent en jours ouvrés (lun-ven).
+      Week-end (sam-dim) : toujours HC.
+
     Saison haute : novembre à mars inclus.
-    HP : 8h-20h, lundi-vendredi.
     Pointe HTA fixe : 8h-10h et 17h-19h, déc-fév, hors dimanche.
     """
     mois         = timestamp.month
     heure        = timestamp.hour
     jour_semaine = timestamp.weekday()   # 0=lundi … 6=dimanche
     saison_haute = mois in [11, 12, 1, 2, 3]
+
+    # Calcul est_hc selon que les HC chevauchent minuit ou non (valable 7j/7)
+    if hc_debut > hc_fin:
+        est_hc = (heure >= hc_debut) or (heure < hc_fin)
+    else:
+        est_hc = (hc_debut <= heure < hc_fin)
+
+    est_hp = not est_hc
 
     if domaine == "HTA":
         if "pointe fixe" in fta:
@@ -198,17 +291,27 @@ def classifier_plage(timestamp: pd.Timestamp, domaine: str, fta: str) -> str:
             if mois in [12, 1, 2] and jour_semaine < 6:
                 if 7 <= heure < 15 or 18 <= heure < 20:
                     return "Pointe"
-        return ("HPH" if (8 <= heure < 20 and jour_semaine < 6) else "HCH") if saison_haute \
-          else ("HPB" if (8 <= heure < 20 and jour_semaine < 6) else "HCB")
+        return ("HPH" if est_hp else "HCH") if saison_haute \
+          else ("HPB" if est_hp else "HCB")
     else:
-        return ("HPH" if (8 <= heure < 20 and jour_semaine < 6) else "HCH") if saison_haute \
-          else ("HPB" if (8 <= heure < 20 and jour_semaine < 6) else "HCB")
+        return ("HPH" if est_hp else "HCH") if saison_haute \
+          else ("HPB" if est_hp else "HCB")
 
 
-def classifier_dataframe(df: pd.DataFrame, domaine: str, fta: str) -> pd.DataFrame:
+def classifier_dataframe(
+    df: pd.DataFrame,
+    domaine: str,
+    fta: str,
+    hc_debut: int = 22,
+    hc_fin: int = 6,
+) -> pd.DataFrame:
     """Ajoute une colonne 'plage' au DataFrame en préservant ses attrs."""
+    attrs_backup = df.attrs.copy()
     df = df.copy()
-    df["plage"] = df["timestamp"].apply(lambda t: classifier_plage(t, domaine, fta))
+    df["plage"] = df["timestamp"].apply(
+        lambda t: classifier_plage(t, domaine, fta, hc_debut, hc_fin)
+    )
+    df.attrs = attrs_backup
     return df
 
 
@@ -224,12 +327,11 @@ def calculer_cout_total(
     type_contrat: str = "contrat_unique",
 ) -> Dict:
     """
-    Calcule le coût TURPE annuel (€/an) pour une configuration donnée.
-    S'adapte automatiquement à la durée des données via facteur_annualisation.
+    Calcule le coût TURPE annuel (€/an).
+    Annualisation automatique via facteur_annualisation dans les attrs.
 
-    Règle d'annualisation :
-    - CG, CC, CS part puissance : toujours annuels, pas de correction.
-    - CS part énergie + CMDPS   : × facteur_annualisation (= 365 / nb_jours).
+    Contrainte respectée : P_HPH <= P_HCH <= P_HPB <= P_HCB
+    (la plage la plus chère a la PS la plus basse)
     """
     domaine_key = {"HTA": "HTA", "BT > 36 kVA": "BT_SUP", "BT ≤ 36 kVA": "BT_INF"}[domaine]
     fixes    = COMPOSANTES_FIXES[domaine_key]
@@ -237,13 +339,15 @@ def calculer_cout_total(
     cc       = fixes["CC"]
     fact_ann = df.attrs.get("facteur_annualisation", 1.0)
 
-    # Énergies réelles sur la période du fichier (kWh)
     energies = df.groupby("plage")["puissance_kw"].sum().to_dict()
 
     if domaine == "HTA":
         bi = HTA_BI[fta]
         ci = HTA_CI[fta]
-        ordre    = sorted(PLAGES_HTA, key=lambda p: bi[p])
+
+        # Formule dégressive : tri par bi DÉCROISSANT (plage la plus chère en 1er)
+        # Contrainte : P[i] <= P[i+1] (PS croissante quand bi décroît)
+        ordre    = sorted(PLAGES_HTA, key=lambda p: bi[p], reverse=True)
         ps_tries = [puissances_souscrites[p] for p in ordre]
 
         cs_puissance = bi[ordre[0]] * ps_tries[0]
@@ -252,7 +356,6 @@ def calculer_cout_total(
         cs_energie = sum((ci[p] / 100) * energies.get(p, 0) * fact_ann for p in PLAGES_HTA)
         cs = cs_puissance + cs_energie
 
-        # CMDPS HTA : utilise puissance_kw_10min si disponible
         col_p = "puissance_kw_10min" if "puissance_kw_10min" in df.columns else "puissance_kw"
         cmdps = 0.0
         for (_, plage), groupe in df.groupby([df["timestamp"].dt.month, "plage"]):
@@ -265,7 +368,10 @@ def calculer_cout_total(
     elif domaine == "BT > 36 kVA":
         bi = BT_SUP_BI[fta]
         ci = BT_SUP_CI[fta]
-        ordre    = sorted(PLAGES_BT_SUP, key=lambda p: bi[p])
+
+        # Même logique : tri bi DÉCROISSANT → HPH(17.61) > HCH(15.96) > HPB(14.56) > HCB(11.98)
+        # → P_HPH <= P_HCH <= P_HPB <= P_HCB
+        ordre    = sorted(PLAGES_BT_SUP, key=lambda p: bi[p], reverse=True)
         ps_tries = [puissances_souscrites[p] for p in ordre]
 
         cs_puissance = bi[ordre[0]] * ps_tries[0]
@@ -274,7 +380,6 @@ def calculer_cout_total(
         cs_energie = sum((ci[p] / 100) * energies.get(p, 0) * fact_ann for p in PLAGES_BT_SUP)
         cs = cs_puissance + cs_energie
 
-        # CMDPS BT > 36 : 12,41 €/h de dépassement
         heures_dep = sum(
             (df[df["plage"] == p]["puissance_kw"] > ps).sum()
             for p, ps in puissances_souscrites.items()
@@ -307,19 +412,42 @@ def calculer_cout_total(
 # 5. MOTEUR D'OPTIMISATION
 # ─────────────────────────────────────────────
 
+def _appliquer_contrainte(ps: Dict[str, float], bi: Dict[str, float]) -> Dict[str, float]:
+    """
+    Applique la contrainte TURPE : P_HPH <= P_HCH <= P_HPB <= P_HCB.
+    Tri par bi décroissant (plus cher = PS la plus basse).
+    Chaque plage moins chère reçoit au minimum la PS de la plus chère précédente.
+    """
+    ps = dict(ps)
+    plages_dec = sorted(ps.keys(), key=lambda p: bi[p], reverse=True)
+    ps_min = 0
+    for p in plages_dec:
+        ps[p] = max(ps[p], ps_min)
+        ps_min = ps[p]
+    return ps
+
+
 def optimiser_puissances(
     df: pd.DataFrame,
     domaine: str,
     fta: str,
     type_contrat: str = "contrat_unique",
     pas_kva: int = 1,
+    ps_actuelles: Optional[Dict[str, float]] = None,
 ) -> Tuple[Dict, pd.DataFrame]:
     """
-    Optimise les puissances souscrites par plage temporelle.
-    Tous les coûts sont exprimés en €/an annualisés.
+    Optimise les puissances souscrites par plage.
+
+    Algorithme : descente par coordonnées avec balayage global initial.
+    1. Balayage d'une PS commune à toutes les plages → point de départ.
+    2. Raffinement par coordonnées : optimise chaque plage en fixant les autres
+       à leurs meilleures valeurs courantes. Répété jusqu'à convergence.
+    3. Application de la contrainte HPH <= HCH <= HPB <= HCB.
+    4. Non-régression : si le résultat est moins bon que la situation actuelle,
+       retourne la situation actuelle inchangée.
 
     Retourne :
-    - Dict : PS optimales + coût annualisé détaillé
+    - Dict : PS optimales + coût annualisé
     - DataFrame : scénarios de sensibilité autour de l'optimal
     """
     plages = (
@@ -331,41 +459,62 @@ def optimiser_puissances(
     if domaine in ["HTA", "BT > 36 kVA"]:
         bi = HTA_BI[fta] if domaine == "HTA" else BT_SUP_BI[fta]
 
-        # Puissance max/min par plage — fallback à 1 kVA si la plage est absente du fichier
         p_global_max  = df["puissance_kw"].max()
-        max_par_plage = {p: (df[df["plage"] == p]["puissance_kw"].max() if (df["plage"] == p).any() else p_global_max) for p in plages}
-        min_par_plage = {p: max(1, (df[df["plage"] == p]["puissance_kw"].quantile(0.50) if (df["plage"] == p).any() else 1)) for p in plages}
-
-        candidats = {
-            p: list(range(
-                max(1, int(min_par_plage[p]) - pas_kva),
-                int(max_par_plage[p]) + pas_kva * 2,
-                pas_kva
-            )) for p in plages
+        max_par_plage = {
+            p: (df[df["plage"] == p]["puissance_kw"].max() if (df["plage"] == p).any() else p_global_max)
+            for p in plages
         }
+        p_global_min = max(1, df["puissance_kw"].quantile(0.40))
 
-        # Optimisation indépendante par plage
-        meilleures_ps = {}
-        for plage in plages:
-            meilleur_cout = float("inf")
-            meilleure_ps  = max_par_plage[plage]
-            for ps_cand in candidats[plage]:
-                ps_test = {p: max_par_plage[p] for p in plages}
-                ps_test[plage] = ps_cand
-                r = calculer_cout_total(df.copy(), domaine, fta, ps_test, type_contrat)
-                if r["Total"] < meilleur_cout:
-                    meilleur_cout = r["Total"]
-                    meilleure_ps  = ps_cand
-            meilleures_ps[plage] = meilleure_ps
+        # ── Étape 1 : balayage global (même PS pour toutes les plages) ─────────
+        # Trouve un bon point de départ sans biais inter-plage
+        meilleur_cout_global = float("inf")
+        ps_commune_opt = int(p_global_max)
 
-        # Contrainte TURPE : Pi+1 >= Pi (ordre croissant des bi)
-        for p in sorted(plages, key=lambda p: bi[p]):
-            ps_max_cumul = max((meilleures_ps[q] for q in plages if bi[q] < bi[p]), default=0)
-            meilleures_ps[p] = max(meilleures_ps[p], ps_max_cumul)
+        borne_min = max(1, int(p_global_min) - pas_kva)
+        borne_max = int(p_global_max) + pas_kva * 2
 
+        for ps_val in range(borne_min, borne_max, pas_kva):
+            ps_test = {p: ps_val for p in plages}
+            r = calculer_cout_total(df.copy(), domaine, fta, ps_test, type_contrat)
+            if r["Total"] < meilleur_cout_global:
+                meilleur_cout_global = r["Total"]
+                ps_commune_opt = ps_val
+
+        # ── Étape 2 : descente par coordonnées autour du point de départ ───────
+        # Chaque plage est optimisée en tenant les autres fixes (itéré 3 fois)
+        current_ps = {p: ps_commune_opt for p in plages}
+        fenetre = max(20, pas_kva * 30)  # fenêtre de recherche autour du point de départ
+
+        for _ in range(3):  # 3 itérations suffisent pour la convergence
+            for plage in plages:
+                meilleur_cout_plage = float("inf")
+                meilleure_ps_plage  = current_ps[plage]
+                borne_inf = max(1, current_ps[plage] - fenetre)
+                borne_sup = min(int(max_par_plage[plage]) + pas_kva, current_ps[plage] + fenetre)
+
+                for ps_cand in range(borne_inf, borne_sup + pas_kva, pas_kva):
+                    ps_test = dict(current_ps)
+                    ps_test[plage] = ps_cand
+                    r = calculer_cout_total(df.copy(), domaine, fta, ps_test, type_contrat)
+                    if r["Total"] < meilleur_cout_plage:
+                        meilleur_cout_plage = r["Total"]
+                        meilleure_ps_plage  = ps_cand
+                current_ps[plage] = meilleure_ps_plage
+
+        # ── Étape 3 : application de la contrainte ────────────────────────────
+        meilleures_ps = _appliquer_contrainte(current_ps, bi)
+
+        # ── Étape 4 : non-régression ──────────────────────────────────────────
+        # Si on a la situation actuelle en entrée, ne pas proposer pire
         resultat_optimal = calculer_cout_total(df.copy(), domaine, fta, meilleures_ps, type_contrat)
+        if ps_actuelles is not None:
+            resultat_ref = calculer_cout_total(df.copy(), domaine, fta, ps_actuelles, type_contrat)
+            if resultat_optimal["Total"] >= resultat_ref["Total"]:
+                meilleures_ps    = dict(ps_actuelles)
+                resultat_optimal = resultat_ref
 
-        # Scénarios de sensibilité
+        # ── Scénarios de sensibilité autour de l'optimal ─────────────────────
         scenarios = []
         for plage in plages:
             ps_opt = meilleures_ps[plage]
@@ -380,7 +529,7 @@ def optimiser_puissances(
 
     else:  # BT ≤ 36 kVA
         p_max         = df["puissance_kw"].max()
-        p_min         = max(1, df["puissance_kw"].quantile(0.50))
+        p_min         = max(1, df["puissance_kw"].quantile(0.40))
         scenarios     = []
         meilleur_cout = float("inf")
         meilleure_ps  = p_max
@@ -395,6 +544,14 @@ def optimiser_puissances(
 
         meilleures_ps    = {"unique": meilleure_ps}
         resultat_optimal = calculer_cout_total(df.copy(), domaine, fta, meilleures_ps, type_contrat)
-        df_scenarios     = pd.DataFrame(scenarios)
+
+        # Non-régression
+        if ps_actuelles is not None:
+            resultat_ref = calculer_cout_total(df.copy(), domaine, fta, ps_actuelles, type_contrat)
+            if resultat_optimal["Total"] >= resultat_ref["Total"]:
+                meilleures_ps    = dict(ps_actuelles)
+                resultat_optimal = resultat_ref
+
+        df_scenarios = pd.DataFrame(scenarios)
 
     return resultat_optimal, df_scenarios
