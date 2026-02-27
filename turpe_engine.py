@@ -396,16 +396,16 @@ def calculer_cout_total(
         cmdps = 0.0
 
     # ── CTA (Contribution Tarifaire d'Acheminement) ───────────────────────────
-    # Taux : 15 % depuis le 1er février 2026 pour les clients Enedis (distribution)
-    # Assiette : CG + CC + CS_puissance (part fixe uniquement, hors énergie et CMDPS)
-    # TVA : 20 % sur la CTA (taux pro depuis le 1er août 2025)
+    # Taux : 15 % depuis le 1er février 2026 — Enedis réseau de distribution
+    # Assiette : CG + CC + CS_puissance (composantes fixes, hors énergie et CMDPS)
+    # La CTA est elle-même soumise à TVA 20 % sur facture — ici on expose HT et TTC
     TAUX_CTA     = 0.15
     TAUX_TVA_CTA = 0.20
     cta_ht       = (cg + cc + cs_puissance) * TAUX_CTA
     cta_ttc      = cta_ht * (1 + TAUX_TVA_CTA)
 
-    total         = cg + cc + cs + cmdps
-    total_avec_cta = total + cta_ttc
+    total     = cg + cc + cs + cmdps          # TURPE HT
+    total_ht  = total + cta_ht                # TURPE + CTA, tout en HT
 
     return {
         "CG":               round(cg, 2),
@@ -415,8 +415,9 @@ def calculer_cout_total(
         "CMDPS":            round(cmdps, 2),
         "CTA_HT":           round(cta_ht, 2),
         "CTA_TTC":          round(cta_ttc, 2),
-        "Total":            round(total, 2),
-        "Total_avec_CTA":   round(total_avec_cta, 2),
+        "Total":            round(total, 2),         # TURPE seul HT
+        "Total_HT":         round(total_ht, 2),      # TURPE + CTA en HT ← indicateur principal
+        "Total_avec_CTA":   round(total_ht, 2),      # alias conservé pour compatibilité
         "facteur_annualisation": fact_ann,
         "puissances_souscrites": puissances_souscrites,
     }
