@@ -28,7 +28,7 @@ from turpe_engine import (
 # ─────────────────────────────────────────────
 st.set_page_config(page_title="Optimisateur TURPE 7", page_icon="⚡", layout="wide")
 
-st.title("⚡ Optimisateur de Puissance Souscrite")
+st.title("⚡ Optimisateur de Facture électrique")
 st.caption("TURPE 7 — Enedis | Délibération CRE n°2025-78 | En vigueur au 1er août 2025")
 st.divider()
 
