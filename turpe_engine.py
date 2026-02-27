@@ -319,6 +319,171 @@ def classifier_dataframe(
 # 4. CALCUL DU COÛT TURPE ANNUALISÉ
 # ─────────────────────────────────────────────
 
+# ─────────────────────────────────────────────
+# 4b. CACHE D'OPTIMISATION
+# ─────────────────────────────────────────────
+
+def _construire_cache(
+    df: pd.DataFrame,
+    domaine: str,
+    fta: str,
+    type_contrat: str = "contrat_unique",
+) -> Dict:
+    """
+    Précalcule toutes les quantités invariantes par rapport aux PS.
+    Appelé une seule fois avant l'optimisation ; permet d'évaluer
+    des milliers de configurations en arithmétique pure, sans toucher au DataFrame.
+
+    Contenu du cache :
+    - constantes tarifaires (bi, ci, cg, cc, fact_ann, ordre des plages)
+    - energies par plage (somme kWh, constante)
+    - cs_energie (constante)
+    - puissances_triees[plage] : array numpy trié croissant des mesures
+      → searchsorted donne nb_dépassements en O(log n) au lieu de O(n)
+    - Pour HTA : puissances_triees_mois[mois][plage] pour la formule CMDPS mensuelle
+    """
+    domaine_key = {"HTA": "HTA", "BT > 36 kVA": "BT_SUP", "BT ≤ 36 kVA": "BT_INF"}[domaine]
+    fixes    = COMPOSANTES_FIXES[domaine_key]
+    cg       = fixes[f"CG_{type_contrat}"]
+    cc       = fixes["CC"]
+    fact_ann = df.attrs.get("facteur_annualisation", 1.0)
+
+    energies = df.groupby("plage")["puissance_kw"].sum().to_dict()
+
+    cache = {
+        "cg": cg, "cc": cc, "fact_ann": fact_ann, "energies": energies,
+        "domaine": domaine, "fta": fta,
+    }
+
+    if domaine == "HTA":
+        bi = HTA_BI[fta]
+        ci = HTA_CI[fta]
+        ordre = sorted(PLAGES_HTA, key=lambda p: bi[p], reverse=True)
+        bi_ordre  = [bi[p] for p in ordre]
+        ci_energie = {p: ci[p] / 100 * energies.get(p, 0) * fact_ann for p in PLAGES_HTA}
+        cs_energie = sum(ci_energie.values())
+
+        col_p = "puissance_kw_10min" if "puissance_kw_10min" in df.columns else "puissance_kw"
+        # Tableaux triés par mois × plage pour CMDPS HTA
+        # dropna() obligatoire (NaN brise searchsorted)
+        pw_mois_plage: Dict[tuple, np.ndarray] = {}
+        for (mois, plage), groupe in df.groupby([df["timestamp"].dt.month, "plage"]):
+            vals = groupe[col_p].dropna().values
+            pw_mois_plage[(mois, plage)] = np.sort(vals)
+
+        cache.update({
+            "bi": bi, "ci": ci, "ordre": ordre, "bi_ordre": bi_ordre,
+            "cs_energie": cs_energie,
+            "pw_mois_plage": pw_mois_plage,
+        })
+
+    elif domaine == "BT > 36 kVA":
+        bi = BT_SUP_BI[fta]
+        ci = BT_SUP_CI[fta]
+        ordre    = sorted(PLAGES_BT_SUP, key=lambda p: bi[p], reverse=True)
+        bi_ordre = [bi[p] for p in ordre]
+        cs_energie = sum((ci[p] / 100) * energies.get(p, 0) * fact_ann for p in PLAGES_BT_SUP)
+
+        # Tableaux triés par plage pour searchsorted O(log n)
+        # dropna() obligatoire : NaN trié en fin de tableau fausse searchsorted
+        pw_plage: Dict[str, np.ndarray] = {
+            p: np.sort(df[df["plage"] == p]["puissance_kw"].dropna().values)
+            for p in PLAGES_BT_SUP
+        }
+        cache.update({
+            "bi": bi, "ci": ci, "ordre": ordre, "bi_ordre": bi_ordre,
+            "cs_energie": cs_energie, "pw_plage": pw_plage,
+        })
+
+    else:  # BT ≤ 36 kVA
+        b  = BT_INF_B[fta]
+        ci = BT_INF_CI[fta]
+        cs_energie = sum((ci[p] / 100) * energies.get(p, 0) * fact_ann for p in ci)
+        pw_unique  = np.sort(df["puissance_kw"].dropna().values)
+        cache.update({"b": b, "ci": ci, "cs_energie": cs_energie, "pw_unique": pw_unique})
+
+    return cache
+
+
+def _cout_depuis_cache(cache: Dict, puissances_souscrites: Dict[str, float]) -> Dict:
+    """
+    Calcule le coût TURPE+CTA HT à partir du cache précalculé.
+    Aucun accès DataFrame — uniquement arithmétique et searchsorted.
+    ~10-30× plus rapide que calculer_cout_total sur DataFrame.
+    """
+    cg       = cache["cg"]
+    cc       = cache["cc"]
+    fact_ann = cache["fact_ann"]
+    domaine  = cache["domaine"]
+    TAUX_CTA = 0.15
+
+    if domaine == "HTA":
+        ordre    = cache["ordre"]
+        bi       = cache["bi"]
+        bi_ordre = cache["bi_ordre"]
+        ps_tries = [puissances_souscrites[p] for p in ordre]
+
+        cs_puissance = bi_ordre[0] * ps_tries[0]
+        for idx in range(1, len(ordre)):
+            cs_puissance += bi_ordre[idx] * (ps_tries[idx] - ps_tries[idx - 1])
+
+        cs = cs_puissance + cache["cs_energie"]
+
+        # CMDPS HTA : sqrt(sum(deltas²)) par mois/plage via searchsorted
+        cmdps = 0.0
+        for (mois, plage), arr in cache["pw_mois_plage"].items():
+            ps  = puissances_souscrites.get(plage, 0)
+            # Éléments > ps : arr[idx_start:]
+            idx = np.searchsorted(arr, ps, side="right")
+            if idx < len(arr):
+                deltas = arr[idx:] - ps
+                cmdps += 0.04 * bi[plage] * np.sqrt(np.dot(deltas, deltas))
+        cmdps *= fact_ann
+
+    elif domaine == "BT > 36 kVA":
+        ordre    = cache["ordre"]
+        bi_ordre = cache["bi_ordre"]
+        ps_tries = [puissances_souscrites[p] for p in ordre]
+
+        cs_puissance = bi_ordre[0] * ps_tries[0]
+        for idx in range(1, len(ordre)):
+            cs_puissance += bi_ordre[idx] * (ps_tries[idx] - ps_tries[idx - 1])
+
+        cs = cs_puissance + cache["cs_energie"]
+
+        # CMDPS BT>36 : nb heures dépassement × 12.41, searchsorted O(log n)
+        heures_dep = 0
+        for p, arr in cache["pw_plage"].items():
+            ps  = puissances_souscrites[p]
+            heures_dep += len(arr) - np.searchsorted(arr, ps, side="right")
+        cmdps = 12.41 * heures_dep * fact_ann
+
+    else:  # BT ≤ 36 kVA
+        ps_unique    = list(puissances_souscrites.values())[0]
+        cs_puissance = cache["b"] * ps_unique
+        cs           = cs_puissance + cache["cs_energie"]
+        cmdps        = 0.0
+
+    cta_ht   = (cg + cc + cs_puissance) * TAUX_CTA
+    total    = cg + cc + cs + cmdps
+    total_ht = total + cta_ht
+
+    return {
+        "CG":             round(cg, 2),
+        "CC":             round(cc, 2),
+        "CS":             round(cs, 2),
+        "CS_puissance":   round(cs_puissance, 2),
+        "CMDPS":          round(cmdps, 2),
+        "CTA_HT":         round(cta_ht, 2),
+        "CTA_TTC":        round(cta_ht * 1.20, 2),
+        "Total":          round(total, 2),
+        "Total_HT":       round(total_ht, 2),
+        "Total_avec_CTA": round(total_ht, 2),
+        "facteur_annualisation": fact_ann,
+        "puissances_souscrites": puissances_souscrites,
+    }
+
+
 def calculer_cout_total(
     df: pd.DataFrame,
     domaine: str,
@@ -428,12 +593,10 @@ def calculer_cout_total(
 # ─────────────────────────────────────────────
 
 def _appliquer_contrainte(ps: Dict[str, float], bi: Dict[str, float]) -> Dict[str, float]:
-    """
-    Applique la contrainte TURPE : P_HPH <= P_HCH <= P_HPB <= P_HCB.
-    Tri par bi décroissant (plus cher = PS la plus basse).
-    Chaque plage moins chère reçoit au minimum la PS de la plus chère précédente.
-    """
+    """Contrainte TURPE : plage plus chère = PS plus basse."""
     ps = dict(ps)
+    for p in sorted(ps, key=lambda x: bi[x], reverse=True):
+        pass  # ordre calculé ci-dessous
     plages_dec = sorted(ps.keys(), key=lambda p: bi[p], reverse=True)
     ps_min = 0
     for p in plages_dec:
@@ -442,34 +605,68 @@ def _appliquer_contrainte(ps: Dict[str, float], bi: Dict[str, float]) -> Dict[st
     return ps
 
 
+def _descente_coordonnees_cache(
+    cache: Dict, plages: List[str], bi: Dict,
+    ps_depart: Dict[str, float],
+    max_par_plage: Dict[str, float],
+    fenetre: int = 25,
+    n_iter: int = 6,
+) -> Dict[str, float]:
+    """Descente par coordonnées utilisant le cache — aucun accès DataFrame."""
+    current = dict(ps_depart)
+    for _ in range(n_iter):
+        improved = False
+        for plage in plages:
+            best_cost = _cout_depuis_cache(cache, current)["Total_HT"]
+            best_ps   = current[plage]
+            lo = max(1, current[plage] - fenetre)
+            hi = min(int(max_par_plage[plage]) + 2, current[plage] + fenetre)
+            for ps_cand in range(lo, hi + 1):
+                if ps_cand == current[plage]:
+                    continue
+                ps_test = dict(current)
+                ps_test[plage] = ps_cand
+                c = _cout_depuis_cache(cache, ps_test)["Total_HT"]
+                if c < best_cost:
+                    best_cost = c
+                    best_ps   = ps_cand
+            if best_ps != current[plage]:
+                current[plage] = best_ps
+                improved = True
+        if not improved:
+            break
+    return current
+
+
 def optimiser_puissances(
     df: pd.DataFrame,
     domaine: str,
     fta: str,
     type_contrat: str = "contrat_unique",
-    pas_kva: int = 1,
+    pas_kva: int = 1,          # conservé pour compatibilité, toujours 1
     ps_actuelles: Optional[Dict[str, float]] = None,
 ) -> Tuple[Dict, pd.DataFrame]:
     """
-    Optimise les puissances souscrites par plage.
+    Optimise les puissances souscrites (minimise Total_HT = TURPE + CTA HT).
 
-    Algorithme : descente par coordonnées avec balayage global initial.
-    1. Balayage d'une PS commune à toutes les plages → point de départ.
-    2. Raffinement par coordonnées : optimise chaque plage en fixant les autres
-       à leurs meilleures valeurs courantes. Répété jusqu'à convergence.
-    3. Application de la contrainte HPH <= HCH <= HPB <= HCB.
-    4. Non-régression : si le résultat est moins bon que la situation actuelle,
-       retourne la situation actuelle inchangée.
+    Grâce au cache précalculé, chaque évaluation est ~20× plus rapide.
+    L'algorithme explore donc un espace bien plus large dans le même temps.
 
-    Retourne :
-    - Dict : PS optimales + coût annualisé
-    - DataFrame : scénarios de sensibilité autour de l'optimal
+    4 phases complémentaires :
+      1. Balayage uniforme P40→Pmax  → trouve P* (meilleur PS commun)
+      2. Descente coordonnées multi-départs autour de P*
+      3. Compression "flatten" : force toutes les plages > V à V
+         → détecte les PS uniformes basses optimales malgré quelques dépassements
+      4. Raffinement fin ±5 kVA autour du meilleur candidat trouvé
     """
     plages = (
         PLAGES_HTA     if domaine == "HTA"         else
         PLAGES_BT_SUP  if domaine == "BT > 36 kVA" else
         ["unique"]
     )
+
+    # ── Construction du cache (1 seul accès DataFrame) ───────────────────────
+    cache = _construire_cache(df, domaine, fta, type_contrat)
 
     if domaine in ["HTA", "BT > 36 kVA"]:
         bi = HTA_BI[fta] if domaine == "HTA" else BT_SUP_BI[fta]
@@ -479,91 +676,110 @@ def optimiser_puissances(
             p: (df[df["plage"] == p]["puissance_kw"].max() if (df["plage"] == p).any() else p_global_max)
             for p in plages
         }
-        p_global_min = max(1, df["puissance_kw"].quantile(0.40))
+        p_min_search = max(1, int(df["puissance_kw"].quantile(0.40)) - 1)
+        p_max_search = int(p_global_max) + 2
 
-        # ── Étape 1 : balayage global (même PS pour toutes les plages) ─────────
-        # Trouve un bon point de départ sans biais inter-plage
-        meilleur_cout_global = float("inf")
-        ps_commune_opt = int(p_global_max)
+        # ── Phase 1 : balayage uniforme ───────────────────────────────────────
+        best_cost_global = float("inf")
+        ps_commune_opt   = int(p_global_max)
 
-        borne_min = max(1, int(p_global_min) - pas_kva)
-        borne_max = int(p_global_max) + pas_kva * 2
-
-        for ps_val in range(borne_min, borne_max, pas_kva):
+        for ps_val in range(p_min_search, p_max_search):
             ps_test = {p: ps_val for p in plages}
-            r = calculer_cout_total(df.copy(), domaine, fta, ps_test, type_contrat)
-            if r["Total"] < meilleur_cout_global:
-                meilleur_cout_global = r["Total"]
-                ps_commune_opt = ps_val
+            c = _cout_depuis_cache(cache, ps_test)["Total_HT"]
+            if c < best_cost_global:
+                best_cost_global = c
+                ps_commune_opt   = ps_val
 
-        # ── Étape 2 : descente par coordonnées autour du point de départ ───────
-        # Chaque plage est optimisée en tenant les autres fixes (itéré 3 fois)
-        current_ps = {p: ps_commune_opt for p in plages}
-        fenetre = max(20, pas_kva * 30)  # fenêtre de recherche autour du point de départ
+        # ── Phase 2 : descente coordonnées multi-départs ──────────────────────
+        best_ps   = {p: ps_commune_opt for p in plages}
+        best_cost = best_cost_global
 
-        for _ in range(3):  # 3 itérations suffisent pour la convergence
-            for plage in plages:
-                meilleur_cout_plage = float("inf")
-                meilleure_ps_plage  = current_ps[plage]
-                borne_inf = max(1, current_ps[plage] - fenetre)
-                borne_sup = min(int(max_par_plage[plage]) + pas_kva, current_ps[plage] + fenetre)
+        departs = sorted(set([
+            max(1, ps_commune_opt - 15),
+            max(1, ps_commune_opt - 8),
+            max(1, ps_commune_opt - 3),
+            ps_commune_opt,
+            ps_commune_opt + 5,
+            ps_commune_opt + 12,
+        ]))
 
-                for ps_cand in range(borne_inf, borne_sup + pas_kva, pas_kva):
-                    ps_test = dict(current_ps)
-                    ps_test[plage] = ps_cand
-                    r = calculer_cout_total(df.copy(), domaine, fta, ps_test, type_contrat)
-                    if r["Total"] < meilleur_cout_plage:
-                        meilleur_cout_plage = r["Total"]
-                        meilleure_ps_plage  = ps_cand
-                current_ps[plage] = meilleure_ps_plage
+        for ps_dep in departs:
+            ps_start  = {p: ps_dep for p in plages}
+            ps_result = _descente_coordonnees_cache(
+                cache, plages, bi, ps_start, max_par_plage, fenetre=30, n_iter=8,
+            )
+            ps_result = _appliquer_contrainte(ps_result, bi)
+            c = _cout_depuis_cache(cache, ps_result)["Total_HT"]
+            if c < best_cost:
+                best_cost = c
+                best_ps   = ps_result
 
-        # ── Étape 3 : application de la contrainte ────────────────────────────
-        meilleures_ps = _appliquer_contrainte(current_ps, bi)
+        # ── Phase 3 : compression "flatten" ──────────────────────────────────
+        # Teste : forcer toutes les plages > V à V (pour V ∈ [p_min, max(best_ps)])
+        # Capture les cas PS uniforme basse > économie > coût dépassements
+        ps_max_current = max(best_ps.values())
+        for v in range(p_min_search, int(ps_max_current) + 1):
+            ps_flat = {p: min(best_ps[p], v) for p in plages}
+            ps_flat = _appliquer_contrainte(ps_flat, bi)
+            c = _cout_depuis_cache(cache, ps_flat)["Total_HT"]
+            if c < best_cost:
+                best_cost = c
+                best_ps   = ps_flat
 
-        # ── Étape 4 : non-régression ──────────────────────────────────────────
-        # Si on a la situation actuelle en entrée, ne pas proposer pire
-        resultat_optimal = calculer_cout_total(df.copy(), domaine, fta, meilleures_ps, type_contrat)
+        # ── Phase 4 : raffinement fin ─────────────────────────────────────────
+        ps_final = _descente_coordonnees_cache(
+            cache, plages, bi, best_ps, max_par_plage, fenetre=6, n_iter=4,
+        )
+        ps_final = _appliquer_contrainte(ps_final, bi)
+        c_final  = _cout_depuis_cache(cache, ps_final)["Total_HT"]
+        if c_final < best_cost:
+            best_cost = c_final
+            best_ps   = ps_final
+
+        meilleures_ps    = best_ps
+        resultat_optimal = _cout_depuis_cache(cache, meilleures_ps)
+
+        # ── Non-régression ────────────────────────────────────────────────────
         if ps_actuelles is not None:
-            resultat_ref = calculer_cout_total(df.copy(), domaine, fta, ps_actuelles, type_contrat)
-            if resultat_optimal["Total"] >= resultat_ref["Total"]:
+            resultat_ref = _cout_depuis_cache(cache, ps_actuelles)
+            if resultat_optimal["Total_HT"] >= resultat_ref["Total_HT"]:
                 meilleures_ps    = dict(ps_actuelles)
                 resultat_optimal = resultat_ref
 
-        # ── Scénarios de sensibilité autour de l'optimal ─────────────────────
+        # ── Scénarios de sensibilité (±8 kVA autour de l'optimal) ────────────
         scenarios = []
         for plage in plages:
             ps_opt = meilleures_ps[plage]
-            for delta in range(-5 * pas_kva, 6 * pas_kva, pas_kva):
+            for delta in range(-8, 9):
                 ps_var = dict(meilleures_ps)
                 ps_var[plage] = max(1, ps_opt + delta)
-                r = calculer_cout_total(df.copy(), domaine, fta, ps_var, type_contrat)
+                r = _cout_depuis_cache(cache, ps_var)
                 r["plage_variee"] = plage
                 r["ps_variee"]    = ps_var[plage]
                 scenarios.append(r)
         df_scenarios = pd.DataFrame(scenarios)
 
-    else:  # BT ≤ 36 kVA
-        p_max         = df["puissance_kw"].max()
-        p_min         = max(1, df["puissance_kw"].quantile(0.40))
+    else:  # BT ≤ 36 kVA — balayage exhaustif, déjà rapide
+        p_max = df["puissance_kw"].max()
+        p_min = max(1, int(df["puissance_kw"].quantile(0.40)) - 1)
         scenarios     = []
-        meilleur_cout = float("inf")
-        meilleure_ps  = p_max
+        best_cost     = float("inf")
+        best_ps_val   = int(p_max)
 
-        for ps in range(max(1, int(p_min) - pas_kva), int(p_max) + pas_kva * 2, pas_kva):
-            r = calculer_cout_total(df.copy(), domaine, fta, {"unique": ps}, type_contrat)
-            r["ps_variee"] = ps
+        for ps_val in range(p_min, int(p_max) + 2):
+            r = _cout_depuis_cache(cache, {"unique": ps_val})
+            r["ps_variee"] = ps_val
             scenarios.append(r)
-            if r["Total"] < meilleur_cout:
-                meilleur_cout = r["Total"]
-                meilleure_ps  = ps
+            if r["Total_HT"] < best_cost:
+                best_cost   = r["Total_HT"]
+                best_ps_val = ps_val
 
-        meilleures_ps    = {"unique": meilleure_ps}
-        resultat_optimal = calculer_cout_total(df.copy(), domaine, fta, meilleures_ps, type_contrat)
+        meilleures_ps    = {"unique": best_ps_val}
+        resultat_optimal = _cout_depuis_cache(cache, meilleures_ps)
 
-        # Non-régression
         if ps_actuelles is not None:
-            resultat_ref = calculer_cout_total(df.copy(), domaine, fta, ps_actuelles, type_contrat)
-            if resultat_optimal["Total"] >= resultat_ref["Total"]:
+            resultat_ref = _cout_depuis_cache(cache, ps_actuelles)
+            if resultat_optimal["Total_HT"] >= resultat_ref["Total_HT"]:
                 meilleures_ps    = dict(ps_actuelles)
                 resultat_optimal = resultat_ref
 
