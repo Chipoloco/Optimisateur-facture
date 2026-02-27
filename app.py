@@ -12,7 +12,6 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import plotly.graph_objects as go
-import plotly.io as pio
 
 from turpe_engine import (
     charger_fichier_auto,
@@ -42,8 +41,81 @@ COULEURS_PLAGES = {
 # ─────────────────────────────────────────────
 # HELPER : figure → image bytes (pour PDF)
 # ─────────────────────────────────────────────
-def fig_to_png(fig, width=700, height=320) -> bytes:
-    return pio.to_image(fig, format="png", width=width, height=height, scale=2)
+def _mpl_courbe_charge(df, couleurs) -> bytes:
+    """Courbe de charge colorée par plage — matplotlib."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    fig, ax = plt.subplots(figsize=(9, 3.2))
+    for plage in sorted(df["plage"].unique()):
+        df_p = df[df["plage"] == plage]
+        ax.scatter(df_p["timestamp"], df_p["puissance_kw"],
+                   s=0.8, color=couleurs.get(plage, "#888"), label=plage, alpha=0.8)
+    ax.set_xlabel("Date", fontsize=8)
+    ax.set_ylabel("Puissance (kW)", fontsize=8)
+    ax.set_title("Courbe de charge par plage horosaisonnière", fontsize=9)
+    ax.legend(fontsize=7, loc="upper right", markerscale=4)
+    ax.tick_params(labelsize=7)
+    fig.tight_layout()
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png", dpi=130)
+    plt.close(fig)
+    return buf.getvalue()
+
+
+def _mpl_composantes(composantes, actuel, optimal) -> bytes:
+    """Graphique barres composantes TURPE — matplotlib."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    import numpy as np
+
+    x = np.arange(len(composantes))
+    w = 0.35
+    fig, ax = plt.subplots(figsize=(9, 3.0))
+    ax.bar(x - w/2, actuel,  w, label="Actuel",   color="#FF6B6B")
+    ax.bar(x + w/2, optimal, w, label="Optimisé", color="#4CAF50")
+    ax.set_xticks(x)
+    ax.set_xticklabels(composantes, fontsize=9)
+    ax.set_ylabel("€/an", fontsize=8)
+    ax.set_title("Composantes TURPE : actuel vs optimisé", fontsize=9)
+    ax.legend(fontsize=8)
+    ax.tick_params(labelsize=8)
+    fig.tight_layout()
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png", dpi=130)
+    plt.close(fig)
+    return buf.getvalue()
+
+
+def _mpl_projection(nb_annees, eco_annuelle) -> bytes:
+    """Graphique projection pluriannuelle — matplotlib."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    annees    = list(range(1, nb_annees + 1))
+    eco_cumul = [eco_annuelle * a for a in annees]
+
+    fig, ax1 = plt.subplots(figsize=(9, 3.0))
+    ax2 = ax1.twinx()
+    ax1.bar(annees, [eco_annuelle] * nb_annees, color="#4CAF50", alpha=0.7, label="Économie annuelle")
+    ax2.plot(annees, eco_cumul, color="#1565C0", marker="o", markersize=3, linewidth=2, label="Cumul")
+    ax1.set_xlabel("Année", fontsize=8)
+    ax1.set_ylabel("Économie annuelle (€)", fontsize=8, color="#4CAF50")
+    ax2.set_ylabel("Économie cumulée (€)", fontsize=8, color="#1565C0")
+    ax1.set_title(f"Projection des économies sur {nb_annees} ans", fontsize=9)
+    ax1.tick_params(labelsize=7)
+    ax2.tick_params(labelsize=7)
+    lines1, labels1 = ax1.get_legend_handles_labels()
+    lines2, labels2 = ax2.get_legend_handles_labels()
+    ax1.legend(lines1 + lines2, labels1 + labels2, fontsize=7, loc="upper left")
+    fig.tight_layout()
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png", dpi=130)
+    plt.close(fig)
+    return buf.getvalue()
 
 
 # ─────────────────────────────────────────────
@@ -54,7 +126,7 @@ def generer_pdf(
     hc_debut, hc_fin,
     ps_actuelles, resultat_actuel, resultat_optimal,
     economie, economie_pct,
-    fig_courbe, fig_compo, fig_projection,
+    nb_annees,
 ) -> bytes:
     from reportlab.lib.pagesizes import A4
     from reportlab.lib import colors
@@ -230,18 +302,23 @@ def generer_pdf(
     story.append(HRFlowable(width="100%", thickness=1, color=BLEU, spaceAfter=8))
 
     story.append(Paragraph("Courbe de charge par plage horosaisonnière", s_h2))
-    png_courbe = fig_to_png(fig_courbe, width=680, height=280)
-    story.append(RLImage(io.BytesIO(png_courbe), width=content_w, height=content_w*280/680))
+    png_courbe = _mpl_courbe_charge(df, COULEURS_PLAGES)
+    story.append(RLImage(io.BytesIO(png_courbe), width=content_w, height=content_w*3.2/9))
     story.append(Spacer(1, 8))
 
     story.append(Paragraph("Composantes TURPE : actuel vs optimisé", s_h2))
-    png_compo = fig_to_png(fig_compo, width=680, height=260)
-    story.append(RLImage(io.BytesIO(png_compo), width=content_w, height=content_w*260/680))
+    composantes_pdf = ["CG", "CC", "CS", "CMDPS"]
+    png_compo = _mpl_composantes(
+        composantes_pdf,
+        [resultat_actuel[c]  for c in composantes_pdf],
+        [resultat_optimal[c] for c in composantes_pdf],
+    )
+    story.append(RLImage(io.BytesIO(png_compo), width=content_w, height=content_w*3.0/9))
     story.append(Spacer(1, 8))
 
-    story.append(Paragraph("Projection des économies sur 10 ans", s_h2))
-    png_proj = fig_to_png(fig_projection, width=680, height=260)
-    story.append(RLImage(io.BytesIO(png_proj), width=content_w, height=content_w*260/680))
+    story.append(Paragraph(f"Projection des économies sur {nb_annees} ans", s_h2))
+    png_proj = _mpl_projection(nb_annees, max(0, economie))
+    story.append(RLImage(io.BytesIO(png_proj), width=content_w, height=content_w*3.0/9))
 
     # ── PIED DE PAGE ──────────────────────────────────────────────────────────
     story.append(Spacer(1, 16))
@@ -658,9 +735,7 @@ with col_dl3:
                     resultat_actuel=resultat_actuel,
                     resultat_optimal=resultat_optimal,
                     economie=economie, economie_pct=economie_pct,
-                    fig_courbe=fig_courbe,
-                    fig_compo=fig_compo,
-                    fig_projection=fig_projection,
+                    nb_annees=nb_annees,
                 )
                 st.session_state["pdf_bytes"] = pdf_bytes
                 st.success("✅ PDF généré !")
